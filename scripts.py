@@ -50,6 +50,7 @@ def to_probabilities(dict_a):
     total = float(sum(dict_a.values()))
     return {k: v/total for k, v in dict_a.items()}
 
+
 def compute_dssp(pdb):
     """Computes DSSP using MDTraj. Expects a single
     trajectory.
@@ -58,6 +59,7 @@ def compute_dssp(pdb):
     # replace blanks with L to make results more readable
     return ['L' if el==' ' else el for el in dssp]
 
+
 def inverse_boltzmann(frequency_cs, frequency_c, frequency_s):
     """ Inverse Boltzmann law:
     -k * T * log(frac{F(c,s), F(s) * F(c)})
@@ -65,6 +67,7 @@ def inverse_boltzmann(frequency_cs, frequency_c, frequency_s):
     return -BOLTZMANN_CONSTANT * 310.15 * math.log(
             frequency_cs / (frequency_c * frequency_s)
         )
+
 
 def compute_bin(val, bins):
     """Computes the bin in which a value belongs to.
@@ -76,6 +79,7 @@ def compute_bin(val, bins):
         bin_result += 1
     return bin_result
 
+
 def compute_sidechain_pdist(pdb):
     """Computes the pairwise euclidean distance of 
     the geometrical centroid of each amino acid sidechain.
@@ -86,13 +90,15 @@ def compute_sidechain_pdist(pdb):
         if sidechain_coords.size < 1:
             continue
         sidechain_centroids[i] = sidechain_coords.mean(0)
-    # square form is more convenient to work with
     sidechain_pdist = squareform(pdist(sidechain_centroids))
 
     return sidechain_pdist
 
+
 # All the routines for approximating the statistical potentials of a dataset and
 # the corresponding functions to infer the energetic contribution of any protein
+
+
 def w1_calculation(pdbs):
     cs = defaultdict(int)
     c = defaultdict(int)
@@ -109,6 +115,7 @@ def w1_calculation(pdbs):
             cs[f"{resname}-{conformation}"] += 1
     return cs, c, s
 
+
 def w1_inference(pdbs, names, cs, c, s):
     result = dict()
     for name, pdb in zip(names, pdbs):
@@ -122,6 +129,7 @@ def w1_inference(pdbs, names, cs, c, s):
                                           (c[conformation], s[resname]))
         result[name] = result_i
     return result
+
 
 def w2_calculation(pdbs, bins=SASA_BINS):
     result_hisi_s = defaultdict(int)
@@ -173,6 +181,7 @@ def w2_calculation(pdbs, bins=SASA_BINS):
            result_hihjsi_cs, result_hihjsi_c, result_hihjsi_s,\
            result_hisisj_cs, result_hisisj_c, result_hisisj_s
 
+
 def w2_inference(pdbs, names,
                  hisi_cs, hisi_c, hisi_s,
                  hihjsi_cs, hihjsi_c, hihjsi_s,
@@ -212,6 +221,7 @@ def w2_inference(pdbs, names,
         result[name] = result_i
     return result
 
+
 def w3_calculation(pdbs, dist_bins=DIST_BINS, cutoff=DIST_CUTOFF):
     result_dijsi_cs = defaultdict(int)
     result_dijsi_s = defaultdict(int)
@@ -245,6 +255,7 @@ def w3_calculation(pdbs, dist_bins=DIST_BINS, cutoff=DIST_CUTOFF):
     return result_dijsi_cs, result_dijsi_c, result_dijsi_s, \
            result_dijsisj_cs, result_dijsisj_c, result_dijsisj_s
 
+
 def w3_inference(pdbs, names, 
                  dijsi_cs, dijsi_c, dijsi_s, 
                  dijsisj_cs, dijsisj_c, dijsisj_s,
@@ -273,6 +284,7 @@ def w3_inference(pdbs, names,
         results[name] = result_i
 
     return results
+
 
 def w4_calculation(pdbs, dist_bins=DIST_BINS, cutoff=DIST_CUTOFF):
 
@@ -317,6 +329,7 @@ def w4_calculation(pdbs, dist_bins=DIST_BINS, cutoff=DIST_CUTOFF):
     return result_tidijsi_cs, result_tidijsi_c, result_tidijsi_s, \
            result_tidijsitj_cs, result_tidijsitj_c, result_tidijsitj_s
 
+
 def w4_inference(pdbs, names, 
                  tidijsi_cs, tidijsi_c, tidijsi_s,
                  tidijsitj_cs, tidijsitj_c, tidijsitj_s,
@@ -355,6 +368,7 @@ def w4_inference(pdbs, names,
                                               tidijsitj_s[f"{resnames[i]}"])
         results[name] = result_i
     return results
+
 
 def w5_calculation(pdbs, dist_bins=DIST_BINS, cutoff=DIST_CUTOFF, sasa_bins=SASA_BINS):
 
@@ -427,6 +441,7 @@ def w5_inference(pdbs, names,
         results[name] = result_i
     return results
 
+
 def w6_calculation(pdbs, sasa_bins=SASA_BINS):
     result_hitisi_cs = defaultdict(int)
     result_hitisi_c = defaultdict(int)
@@ -451,6 +466,7 @@ def w6_calculation(pdbs, sasa_bins=SASA_BINS):
             result_hitisi_s[f"{resnames[i]}"] += 1
 
     return result_hitisi_cs, result_hitisi_c, result_hitisi_s
+
 
 def w6_inference(pdbs, names,
                  hitisi_cs, hitisi_c, hitisi_s,
@@ -477,124 +493,137 @@ def w6_inference(pdbs, names,
         results[name] = result_i
     return results
 
+
 def serialize(var, name):
     """Helper function to serialise a Python dictionary in
     JSON format. Handles opening and closing file.
     """
     with open(name, "w") as f:
         json.dump(var, f)
-    
+
+
+def deserialize(path):
+    result = {}
+    with open(path, "r") as f:
+        result = json.load(f)
+    return result
+
+
 def compute_statistical_potential(pdbs, dataset_path, dataset_name):
     """The main routine to compute the statistical potential of dataset.
     The results are serealised in JSON format.
     """
+
+    results = dict()
+    
     w1 = w1_calculation(pdbs)
     w2 = w2_calculation(pdbs)
     w3 = w3_calculation(pdbs)
     w4 = w4_calculation(pdbs)
     w5 = w5_calculation(pdbs)
     w6 = w6_calculation(pdbs)
+
+    results["W1_F_TERM1_CS"] = to_probabilities(w1[0])
+    results["W1_F_TERM1_C"]  = to_probabilities(w1[1])
+    results["W1_F_TERM1_S"]  = to_probabilities(w1[2])
+
+    results["W2_F_TERM1_CS"] = to_probabilities(w2[0])
+    results["W2_F_TERM1_C"]  = to_probabilities(w2[1])
+    results["W2_F_TERM1_S"]  = to_probabilities(w2[2])
+    results["W2_F_TERM2_CS"] = to_probabilities(w2[3])
+    results["W2_F_TERM2_C"]  = to_probabilities(w2[4])
+    results["W2_F_TERM2_S"]  = to_probabilities(w2[5])
+    results["W2_F_TERM3_CS"] = to_probabilities(w2[6])
+    results["W2_F_TERM3_C"]  = to_probabilities(w2[7])
+    results["W2_F_TERM3_S"]  = to_probabilities(w2[8])
+
+    results["W3_F_TERM1_CS"] = to_probabilities(w3[0])
+    results["W3_F_TERM1_C"]  = to_probabilities(w3[1])
+    results["W3_F_TERM1_S"]  = to_probabilities(w3[2])
+    results["W3_F_TERM2_CS"] = to_probabilities(w3[3])
+    results["W3_F_TERM2_C"]  = to_probabilities(w3[4])
+    results["W3_F_TERM2_S"]  = to_probabilities(w3[5])
+
+    results["W4_F_TERM1_CS"] = to_probabilities(w4[0])
+    results["W4_F_TERM1_C"]  = to_probabilities(w4[1])
+    results["W4_F_TERM1_S"]  = to_probabilities(w4[2])
+    results["W4_F_TERM2_CS"] = to_probabilities(w4[3])
+    results["W4_F_TERM2_C"]  = to_probabilities(w4[4])
+    results["W4_F_TERM2_S"]  = to_probabilities(w4[5])
+
+    results["W5_F_TERM1_CS"] = to_probabilities(w5[0])
+    results["W5_F_TERM1_C"]  = to_probabilities(w5[1])
+    results["W5_F_TERM1_S"]  = to_probabilities(w5[2])
+
+    results["W6_F_TERM1_CS"] = to_probabilities(w6[0])
+    results["W6_F_TERM1_C"]  = to_probabilities(w6[1])
+    results["W6_F_TERM1_S"]  = to_probabilities(w6[2])
     
-    W1_F_TERM1_CS = to_probabilities(w1[0])
-    W1_F_TERM1_C = to_probabilities(w1[1])
-    W1_F_TERM1_S = to_probabilities(w1[2])
-
-    W2_F_TERM1_CS = to_probabilities(w2[0])
-    W2_F_TERM1_C = to_probabilities(w2[1])
-    W2_F_TERM1_S = to_probabilities(w2[2])
-    W2_F_TERM2_CS = to_probabilities(w2[3])
-    W2_F_TERM2_C = to_probabilities(w2[4])
-    W2_F_TERM2_S = to_probabilities(w2[5])
-    W2_F_TERM3_CS = to_probabilities(w2[6])
-    W2_F_TERM3_C = to_probabilities(w2[7])
-    W2_F_TERM3_S = to_probabilities(w2[8])
-
-    W3_F_TERM1_CS = to_probabilities(w3[0])
-    W3_F_TERM1_C = to_probabilities(w3[1])
-    W3_F_TERM1_S = to_probabilities(w3[2])
-    W3_F_TERM2_CS = to_probabilities(w3[3])
-    W3_F_TERM2_C = to_probabilities(w3[4])
-    W3_F_TERM2_S = to_probabilities(w3[5])
-
-    W4_F_TERM1_CS =  to_probabilities(w4[0])
-    W4_F_TERM1_C = to_probabilities(w4[1])
-    W4_F_TERM1_S =  to_probabilities(w4[2])
-    W4_F_TERM2_CS =  to_probabilities(w4[3])
-    W4_F_TERM2_C = to_probabilities(w4[4])
-    W4_F_TERM2_S =  to_probabilities(w4[5])
-
-    W5_F_TERM1_CS =  to_probabilities(w5[0])
-    W5_F_TERM1_C = to_probabilities(w5[1])
-    W5_F_TERM1_S =  to_probabilities(w5[2])
-
-    W6_F_TERM1_CS =  to_probabilities(w6[0])
-    W6_F_TERM1_C = to_probabilities(w6[1])
-    W6_F_TERM1_S =  to_probabilities(w6[2])
-    
-    weights = [
-        W1_F_TERM1_CS,
-        W1_F_TERM1_C ,
-        W1_F_TERM1_S ,
-        W2_F_TERM1_CS,
-        W2_F_TERM1_C ,
-        W2_F_TERM1_S ,
-        W2_F_TERM2_CS,
-        W2_F_TERM2_C ,
-        W2_F_TERM2_S ,
-        W2_F_TERM3_CS,
-        W2_F_TERM3_C ,
-        W2_F_TERM3_S ,
-        W3_F_TERM1_CS,
-        W3_F_TERM1_C ,
-        W3_F_TERM1_S ,
-        W3_F_TERM2_CS,
-        W3_F_TERM2_C ,
-        W3_F_TERM2_S ,
-        W4_F_TERM1_CS,
-        W4_F_TERM1_C ,
-        W4_F_TERM1_S ,
-        W4_F_TERM2_CS,
-        W4_F_TERM2_C ,
-        W4_F_TERM2_S ,
-        W5_F_TERM1_CS,
-        W5_F_TERM1_C ,
-        W5_F_TERM1_S ,
-        W6_F_TERM1_CS,
-        W6_F_TERM1_C ,
-        W6_F_TERM1_S 
-    ]
-    weight_names = [
-        "W1_F_TERM1_CS",
-        "W1_F_TERM1_C", 
-        "W1_F_TERM1_S", 
-        "W2_F_TERM1_CS",
-        "W2_F_TERM1_C", 
-        "W2_F_TERM1_S", 
-        "W2_F_TERM2_CS",
-        "W2_F_TERM2_C",
-        "W2_F_TERM2_S",
-        "W2_F_TERM3_CS",
-        "W2_F_TERM3_C",
-        "W2_F_TERM3_S",
-        "W3_F_TERM1_CS",
-        "W3_F_TERM1_C",
-        "W3_F_TERM1_S",
-        "W3_F_TERM2_CS",
-        "W3_F_TERM2_C",
-        "W3_F_TERM2_S",
-        "W4_F_TERM1_CS",
-        "W4_F_TERM1_C",
-        "W4_F_TERM1_S",
-        "W4_F_TERM2_CS",
-        "W4_F_TERM2_C",
-        "W4_F_TERM2_S",
-        "W5_F_TERM1_CS",
-        "W5_F_TERM1_C",
-        "W5_F_TERM1_S",
-        "W6_F_TERM1_CS",
-        "W6_F_TERM1_C",
-        "W6_F_TERM1_S"
-    ]
-    
-    for w, name in zip(weights, weight_names):
+    for name, w in results.items():
         serialize(w, f"{dataset_path}/{name}-{dataset_name}.json")
+
+
+def get_statistical_potentials(dataset_path, dataset_name):
+    result = dict()
+    result["W1_F_TERM1_CS"] = deserialize(f"{dataset_path}/W1_F_TERM1_CS-{dataset_name}.json")
+    result["W1_F_TERM1_C"]  = deserialize(f"{dataset_path}/W1_F_TERM1_C-{dataset_name}.json")
+    result["W1_F_TERM1_S"]  = deserialize(f"{dataset_path}/W1_F_TERM1_S-{dataset_name}.json")
+    
+    result["W2_F_TERM1_CS"] = deserialize(f"{dataset_path}/W2_F_TERM1_CS-{dataset_name}.json")
+    result["W2_F_TERM1_C"]  = deserialize(f"{dataset_path}/W2_F_TERM1_C-{dataset_name}.json")
+    result["W2_F_TERM1_S"]  = deserialize(f"{dataset_path}/W2_F_TERM1_S-{dataset_name}.json")
+    result["W2_F_TERM2_CS"] = deserialize(f"{dataset_path}/W2_F_TERM2_CS-{dataset_name}.json")
+    result["W2_F_TERM2_C"]  = deserialize(f"{dataset_path}/W2_F_TERM2_C-{dataset_name}.json")
+    result["W2_F_TERM2_S"]  = deserialize(f"{dataset_path}/W2_F_TERM2_S-{dataset_name}.json")
+    result["W2_F_TERM3_CS"] = deserialize(f"{dataset_path}/W2_F_TERM3_CS-{dataset_name}.json")
+    result["W2_F_TERM3_C"]  = deserialize(f"{dataset_path}/W2_F_TERM3_C-{dataset_name}.json")
+    result["W2_F_TERM3_S"]  = deserialize(f"{dataset_path}/W2_F_TERM3_S-{dataset_name}.json")
+    
+    result["W3_F_TERM1_CS"] = deserialize(f"{dataset_path}/W3_F_TERM1_CS-{dataset_name}.json")
+    result["W3_F_TERM1_C"]  = deserialize(f"{dataset_path}/W3_F_TERM1_C-{dataset_name}.json")
+    result["W3_F_TERM1_S"]  = deserialize(f"{dataset_path}/W3_F_TERM1_S-{dataset_name}.json")
+    result["W3_F_TERM2_CS"] = deserialize(f"{dataset_path}/W3_F_TERM2_CS-{dataset_name}.json")
+    result["W3_F_TERM2_C"]  = deserialize(f"{dataset_path}/W3_F_TERM2_C-{dataset_name}.json")
+    result["W3_F_TERM2_S"]  = deserialize(f"{dataset_path}/W3_F_TERM2_S-{dataset_name}.json")
+    
+    result["W4_F_TERM1_CS"] = deserialize(f"{dataset_path}/W4_F_TERM1_CS-{dataset_name}.json")
+    result["W4_F_TERM1_C"]  = deserialize(f"{dataset_path}/W4_F_TERM1_C-{dataset_name}.json")
+    result["W4_F_TERM1_S"]  = deserialize(f"{dataset_path}/W4_F_TERM1_S-{dataset_name}.json")
+    result["W4_F_TERM2_CS"] = deserialize(f"{dataset_path}/W4_F_TERM2_CS-{dataset_name}.json")
+    result["W4_F_TERM2_C"]  = deserialize(f"{dataset_path}/W4_F_TERM2_C-{dataset_name}.json")
+    result["W4_F_TERM2_S"]  = deserialize(f"{dataset_path}/W4_F_TERM2_S-{dataset_name}.json")
+    
+    result["W5_F_TERM1_CS"] = deserialize(f"{dataset_path}/W5_F_TERM1_CS-{dataset_name}.json")
+    result["W5_F_TERM1_C"]  = deserialize(f"{dataset_path}/W5_F_TERM1_C-{dataset_name}.json")
+    result["W5_F_TERM1_S"]  = deserialize(f"{dataset_path}/W5_F_TERM1_S-{dataset_name}.json")
+    
+    result["W6_F_TERM1_CS"] = deserialize(f"{dataset_path}/W6_F_TERM1_CS-{dataset_name}.json")
+    result["W6_F_TERM1_C"]  = deserialize(f"{dataset_path}/W6_F_TERM1_C-{dataset_name}.json")
+    result["W6_F_TERM1_S"]  = deserialize(f"{dataset_path}/W6_F_TERM1_S-{dataset_name}.json")
+
+    return result
+
+
+def compute_inverse_boltzmann(pdbs, pdb_names, dataset_path, dataset_names):
+    result = dict()
+    for dataset in dataset_names:
+        statistical_potentials = get_statistical_potentials(dataset_path, dataset)
+        w1 = w1_inference(pdbs, pdb_names, result["W1_F_TERM1_CS"], result["W1_F_TERM1_C"], result["W1_F_TERM1_S"])
+        w2 = w2_inference(pdbs, pdb_names, result["W2_F_TERM1_CS"], result["W2_F_TERM1_C"], result["W2_F_TERM1_S"],
+                          result["W2_F_TERM2_CS"], result["W2_F_TERM2_C"], result["W2_F_TERM2_S"],
+                          result["W2_F_TERM3_CS"], result["W2_F_TERM3_C"], result["W2_F_TERM3_S"])
+        w3 = w3_inference(pdbs, pdb_names, result["W3_F_TERM1_CS"], result["W3_F_TERM1_C"], result["W3_F_TERM1_S"],
+                          result["W3_F_TERM2_CS"], result["W3_F_TERM2_C"], result["W3_F_TERM2_S"])
+        w4 = w4_inference(pdbs, pdb_names, result["W4_F_TERM1_CS"], result["W4_F_TERM1_C"], result["W4_F_TERM1_S"],
+                          result["W4_F_TERM2_CS"], result["W4_F_TERM2_C"], result["W4_F_TERM2_S"])
+        w5 = w5_inference(pdbs, pdb_names, result["W5_F_TERM1_CS"], result["W5_F_TERM1_C"], result["W5_F_TERM1_S"])
+        w6 = w6_inference(pdbs, pdb_names, result["W6_F_TERM1_CS"], result["W6_F_TERM1_C"], result["W6_F_TERM1_S"])
+
+        result[f"w1-{dataset_name}"] = w1
+        result[f"w2-{dataset_name}"] = w2
+        result[f"w3-{dataset_name}"] = w3
+        result[f"w4-{dataset_name}"] = w4
+        result[f"w5-{dataset_name}"] = w5
+        result[f"w6-{dataset_name}"] = w6
+
+    return result
