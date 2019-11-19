@@ -5,6 +5,8 @@ from scipy.spatial.distance import pdist, squareform
 from scipy import constants
 import mdtraj as md
 import json
+import itertools
+from abc import ABC, abstractmethod
 
 # https://www.sciencedirect.com/science/article/pii/S1476927114001698
 Residue_opt_ref_asa = {
@@ -41,6 +43,8 @@ BOLTZMANN_CONSTANT = constants.Boltzmann
 # from https://www.tandfonline.com/doi/pdf/10.1080/07391102.2015.1073631
 DIST_BINS = np.append(np.arange(3, 8.2, 0.2), (np.inf,)) 
 SASA_BINS = [0.05, 0.2, 0.4, 0.55, math.inf]
+
+GLOBAL_CACHE = dict()
 
 
 def to_probabilities(dict_a):
@@ -94,6 +98,257 @@ def compute_sidechain_pdist(pdb):
 
     return sidechain_pdist
 
+class Heuristic(ABC):
+    def __init__(self, name, pdbs, position):
+        if position not in ['i', 'j', 'ij']:
+            raise ValueError("Expeceted position to be either i, j or ij.")
+        self._name = name
+        self._pdbs = pdbs
+        self._count = len(pdbs)
+        # using list as cache (instead of dict) as hash(pdb) does not always work
+        self.cache = [0] * len(pdbs)
+        self._position = position
+    
+    @abstractmethod
+    def _compute(self, pdb):
+        raise NotImplementedError("Abstract method")
+
+    def compute(self, i):
+        if isinstance(self.cache[i], int) and self.cache[i] == 0:
+            result = self._compute(self._pdbs[i])
+            self.cache[i] = result
+        return self.cache[i]
+
+    def compute_all(self):
+        result = list()
+        for i in range(len(self._pdbs)):
+            result.append(self.compute(i))
+        return result
+
+    @property
+    def name(self):
+        return self._name + self._position
+
+    @property
+    def position(self):
+        return self._position
+
+    @property
+    def count(self):
+        return self._count
+    
+    
+class SidechainPdistHeuristic(Heuristic):
+
+    def __init__(self, name, pdbs, bins, cutoff):
+        super().__init__(name, pdbs, "ij")
+        self._bins = bins
+        self._cutoff = cutoff
+
+    def _compute(self, pdb):
+        pdist = compute_sidechain_pdist(pdb)
+        result = np.full_like(pdist, np.NaN, dtype="<U3")
+        for i in range(pdist.shape[0]):
+            for j in range(i+1, pdist.shape[1]):
+                if pdist[i, j] < self._cutoff:
+                    result[i, j] = compute_bin(pdist[i, j], self._bins)
+                    result[j, i] = result[i, j]
+        return result
+
+
+class DSSPHeuristic(Heuristic):
+
+    def __init__(self, name, pdbs, cutoff, position):
+        super().__init__(name, pdbs, position)
+        self._cutoff = cutoff
+
+    def _compute(self, pdb):
+        dssp = compute_dssp(pdb)
+        result = np.full((len(dssp), len(dssp)), np.NaN, dtype="<U3")
+        for i in range(result.shape[0]):
+            lower_bound = max(0, i-self._cutoff)
+            upper_bound = min(i+self._cutoff, len(dssp))
+            for j in range(lower_bound, upper_bound):
+                result[i, j] = dssp[j]
+                # result[j, i] = dssp[j]
+            result[i, i] = dssp[i]
+
+        return result
+
+
+class SASAHeuristic(Heuristic):
+
+    def __init__(self, name, pdbs, cutoff, position):
+        super().__init__(name, pdbs, position)
+        self._cutoff = cutoff
+
+    def _compute(self, pdb):
+        sasa = md.shrake_rupley(pdb, mode='residue')[0] * 100
+        result = np.full((len(sasa), len(sasa)), np.NaN, dtype="<U3")
+        resnames = [res.name for res in pdb.residues]
+        for i in range(result.shape[0]):
+            lower_bound = max(0, i-self._cutoff)
+            upper_bound = min(i+self._cutoff, len(dssp))
+            for j in range(lower_bound, upper_bound):
+                ratio = compute_bin(sasa[j] / Residue_opt_ref_asa[resnames[j]], self._bins)
+                bin_i = compute_bin(ratio, bins)
+                result[i, j] = ratio
+            ratio = compute_bin(sasa[i] / Residue_opt_ref_asa[resnames[i]], self._bins)
+            result[i, i] = ratio
+                # result[j, i] = compute_bin(sasa[j] / Residue_opt_ref_asa[resnames[j]], self._bins)
+
+        return result
+
+
+class AAPHeuristic(Heuristic):
+
+    def __init__(self, name, pdbs, cutoff, position):
+        super().__init__(name, pdbs, position)
+        self._cutoff = cutoff
+
+    def _compute(self, pdb):
+        resnames = [res.name for res in pdb.residues]
+        result = np.full((len(resnames), len(resnames)), np.NaN, dtype="<U3")
+        for i in range(result.shape[0]):
+            lower_bound = max(0, i-self._cutoff)
+            upper_bound = min(i+self._cutoff, len(dssp))
+            for j in range(lower_bound, upper_bound):
+                result[i, j] = resnames[j]
+            result[i, i] = resnames[i]
+        return result
+
+class CombinedHeuristics:
+    def __init__(self, heuristics):
+        count = set(h.count for h in heuristics)
+        if len(count) != 1:
+            raise ValueError("Expected all heuristic objects to own the same number of structs")
+        self._heuristics = heuristics
+        self._cache = dict()
+        self._count = count.pop()
+
+    def get_frequencies(self):
+        if (len(self._cache) == 0):
+            result = defaultdict(int)
+            for struct_i in range(self._count):
+                h_results = [h.compute(struct_i) for h in self._heuristics]
+                for i in range(h_results[0].shape[0]):
+                    for j in range(i+1, h_results[0].shape[0]):
+                        failed = False
+                        key = []
+                        for h_i, h in enumerate(self._heuristics):
+                            # check if res_i and res_j are available for this computation
+                            val_ij = h_results[h_i][i, j]
+                            if is_nan(val_ij):
+                                failed = True
+                                break
+                            # if available we can store the value of i or j or ij 
+                            # depending on heuristic
+                            if h.position == 'i':
+                                key.append(str(h_results[h_i][i, i]))
+                            else:
+                                key.append(val_ij)
+
+                        if not failed:
+                            result['-'.join(key)] += 1
+            self._cache = result
+        return self._cache
+
+    def serialize(self):
+        """Serialize object
+        """
+        raise NotImplementedError("serialize not implemented")
+
+    @staticmethod
+    def deserialize(path):
+        raise NotImplementedError("deserialize not implemented")
+
+    @property
+    def name(self):
+        return f"CombinedHeuristics({'-'.join([h.name for h in self._heuristics])})"
+    
+    def __repr__(self):
+        return self.name
+
+    def __hash__(self):
+        """The hash of a CombinedHeuristics object is
+        the hash of the string which combines the name
+        of all Heuristic objects.
+        """
+        return hash(''.join([h.name for h in self._heuristics]))
+    
+
+def debug_approx_w(c):
+    """Function to get w approximation calculation
+    in a readable string format.
+    """
+    upper = []
+    lower = []
+    for x in range(1, len(c)+1):
+        if x % 2 == 1:
+            upper.append([f"P({''.join(i)})" for i in itertools.combinations(c, r=x)])
+        else:
+            lower.append([f"P({''.join(i)})" for i in itertools.combinations(c, r=x)])
+    return '*'.join(flatten(upper))+' / '+'*'.join(flatten(lower))
+
+
+def debug_compute_w(c):
+    """Function to get w calculation
+    in a readable string format.
+    """
+    computations = list()
+    for i in range(2, len(c)+1):
+        for approx_c_i in itertools.combinations(c, r=i):
+            computations.append(approx_w(approx_c_i))
+    return ' +\n'.join(computations)
+
+
+def approx_w_heuristics(h):
+    if len(h) < 2:
+        raise ValueError("Expected h to be a dict with two or more entries.")
+    upper = list()
+    lower = list()
+    for x in range(1, len(h) + 1):
+        if x % 2 == 1:
+            upper.extend([CombinedHeuristics(combo) for combo in itertools.combinations(h, r=x)])
+        else:
+            lower.extend([CombinedHeuristics(combo) for combo in itertools.combinations(h, r=x)])
+    return upper, lower
+
+def w_heuristics(h):
+    computations = list()
+    for i in range(2, len(h) + 1):
+        for approx_c_i in itertools.combinations(h, r=i):
+            computations.append(approx_w_heuristics(approx_c_i))
+    return computations
+
+
+def is_nan(val):
+    if np.isreal(val):
+        return np.isnan(val)
+    return val == 'nan'
+
+
+def get_kwargs(name, kwargs):
+    if name not in kwargs:
+        raise ValueError(f"Expected {name} in kwargs.")
+    return kwargs[name]
+
+
+def compute_heuristics(computation_list, serialize=True, **kwargs):
+    result = []
+    for e in computation_list:
+        result_i = []
+        for subexpression in e:
+            for term in subexpression:
+                if term not in GLOBAL_CACHE:
+                    GLOBAL_CACHE[term] = term.get_frequencies()
+                if serialize:
+                    path = f"{get_kwargs("path", kwargs)}/{get_kwargs("set_name", kwargs)}-{term.name}.json"
+                    serialize(GLOBAL_CACHE[term], path)
+                result_i.append(GLOBAL_CACHE[term])
+        result.append(result_i)
+    return result
+
 
 # All the routines for approximating the statistical potentials of a dataset and
 # the corresponding functions to infer the energetic contribution of any protein
@@ -125,8 +380,11 @@ def w1_inference(pdbs, names, cs, c, s):
             if conformation == 'NA':
                 continue
             resname = res.name
-            result_i += inverse_boltzmann(cs[f"{resname}-{conformation}"],
-                                          (c[conformation], s[resname]))
+            try:
+                result_i += inverse_boltzmann(cs[f"{resname}-{conformation}"],
+                                              c[conformation], s[resname])
+            except:
+                pass
         result[name] = result_i
     return result
 
@@ -200,9 +458,11 @@ def w2_inference(pdbs, names,
             ratio = sasa[i] / Residue_opt_ref_asa[resname_i]
             bin_i = compute_bin(ratio, bins)
 
-            result_i += inverse_boltzmann(hisi_cs[f"{resname_i}-{bin_i}"],
-                                          hisi_c[f"{bin_i}"], hisi_s[f"{resname_i}"])
-
+            try:
+                result_i += inverse_boltzmann(hisi_cs[f"{resname_i}-{bin_i}"],
+                                              hisi_c[f"{bin_i}"], hisi_s[f"{resname_i}"])
+            except:
+                pass
             lower_bound = max(0, i-(WINDOW_SIZE//2))
             upper_bound = min(i+(WINDOW_SIZE//2), pdb.n_residues)
             for j in range(lower_bound, upper_bound):
@@ -212,12 +472,16 @@ def w2_inference(pdbs, names,
                 ratio_j = sasa[j] / Residue_opt_ref_asa[resname_j]
                 bin_j = compute_bin(ratio_j, bins)
 
-                result_i += inverse_boltzmann(hihjsi_cs[f"{resname_i}-{bin_j}-{bin_j}"],
+                try:
+                    val = inverse_boltzmann(hihjsi_cs[f"{resname_i}-{bin_j}-{bin_j}"],
                                               hihjsi_c[f"{bin_i}-{bin_j}"], 
                                               hihjsi_s[f"{resname_i}"])
-                result_i += inverse_boltzmann(hisisj_cs[f"{resname_i}-{resname_j}-{bin_j}"],
+                    val += inverse_boltzmann(hisisj_cs[f"{resname_i}-{resname_j}-{bin_j}"],
                                               hisisj_c[f"{bin_j}"], 
                                               hisisj_s[f"{resname_i}-{resname_j}"])
+                    result_i += values
+                except:
+                    continue
         result[name] = result_i
     return result
 
@@ -275,12 +539,16 @@ def w3_inference(pdbs, names,
                     continue
                 bin_i = compute_bin(dist, dist_bins)
 
-                result_i += inverse_boltzmann(dijsi_cs[f"{resnames[res_i]}-{bin_i}"],
-                                              dijsi_c[f"{bin_i}"], dijsi_s[f"{resnames[res_i]}"])
+                try:
+                    val = inverse_boltzmann(dijsi_cs[f"{resnames[res_i]}-{bin_i}"],
+                                                  dijsi_c[f"{bin_i}"], dijsi_s[f"{resnames[res_i]}"])
 
-                result_i += inverse_boltzmann(dijsisj_cs[f"{resnames[res_i]}-{resnames[res_j]}-{bin_i}"],
-                                              dijsisj_c[f"{bin_i}"],
-                                              dijsisj_s[f"{resnames[res_i]}-{resnames[res_j]}"])
+                    val += inverse_boltzmann(dijsisj_cs[f"{resnames[res_i]}-{resnames[res_j]}-{bin_i}"],
+                                                      dijsisj_c[f"{bin_i}"],
+                                                      dijsisj_s[f"{resnames[res_i]}-{resnames[res_j]}"])
+                    result_i += val
+                except:
+                    pass
         results[name] = result_i
 
     return results
@@ -359,13 +627,17 @@ def w4_inference(pdbs, names,
 
                 dist_bin_i = compute_bin(dist, dist_bins)
 
-                result_i += inverse_boltzmann(tidijsi_cs[f"{resnames[i]}-{dssp[i]}-{dist_bin_i}"],
-                                              tidijsi_c[f"{dssp[i]}-{dist_bin_i}"],
-                                              tidijsi_s[f"{resnames[i]}"])
+                try:
+                    val = inverse_boltzmann(tidijsi_cs[f"{resnames[i]}-{dssp[i]}-{dist_bin_i}"],
+                                                  tidijsi_c[f"{dssp[i]}-{dist_bin_i}"],
+                                                  tidijsi_s[f"{resnames[i]}"])
 
-                result_i += inverse_boltzmann(tidijsitj_cs[f"{resnames[i]}-{dssp[i]}-{dist_bin_i}-{dssp[j]}"],
-                                              tidijsitj_c[f"{dssp[j]}-{dist_bin_i}-{dssp[j]}"],
-                                              tidijsitj_s[f"{resnames[i]}"])
+                    val += inverse_boltzmann(tidijsitj_cs[f"{resnames[i]}-{dssp[i]}-{dist_bin_i}-{dssp[j]}"],
+                                                  tidijsitj_c[f"{dssp[j]}-{dist_bin_i}-{dssp[j]}"],
+                                                  tidijsitj_s[f"{resnames[i]}"])
+                    result_i = val
+                except:
+                    pass
         results[name] = result_i
     return results
 
@@ -435,9 +707,12 @@ def w5_inference(pdbs, names,
 
                 dist_bin_i = compute_bin(dist, dist_bins)
 
-                result_i += inverse_boltzmann(hidijsi_cs[f"{resname_i}-{sasa_bin_i}-{dist_bin_i}"],
-                                              hidijsi_c[f"{sasa_bin_i}-{dist_bin_i}"],
-                                              hidijsi_s[f"{resname_i}"])
+                try:
+                    result_i += inverse_boltzmann(hidijsi_cs[f"{resname_i}-{sasa_bin_i}-{dist_bin_i}"],
+                                                  hidijsi_c[f"{sasa_bin_i}-{dist_bin_i}"],
+                                                  hidijsi_s[f"{resname_i}"])
+                except:
+                    pass
         results[name] = result_i
     return results
 
@@ -487,9 +762,12 @@ def w6_inference(pdbs, names,
             ratio = sasa[i] / Residue_opt_ref_asa[resname_i]
             sasa_bin_i = compute_bin(ratio, sasa_bins)
 
-            result_i += inverse_boltzmann(hitisi_cs[f"{resnames[i]}-{sasa_bin_i}-{dssp[i]}"],
-                                          hitisi_c[f"{sasa_bin_i}-{dssp[i]}"],
-                                          hitisi_s[f"{resnames[i]}"])
+            try:
+                result_i += inverse_boltzmann(hitisi_cs[f"{resnames[i]}-{sasa_bin_i}-{dssp[i]}"],
+                                              hitisi_c[f"{sasa_bin_i}-{dssp[i]}"],
+                                              hitisi_s[f"{resnames[i]}"])
+            except:
+                pass
         results[name] = result_i
     return results
 
@@ -608,22 +886,30 @@ def compute_inverse_boltzmann(pdbs, pdb_names, dataset_path, dataset_names):
     result = dict()
     for dataset in dataset_names:
         statistical_potentials = get_statistical_potentials(dataset_path, dataset)
-        w1 = w1_inference(pdbs, pdb_names, result["W1_F_TERM1_CS"], result["W1_F_TERM1_C"], result["W1_F_TERM1_S"])
-        w2 = w2_inference(pdbs, pdb_names, result["W2_F_TERM1_CS"], result["W2_F_TERM1_C"], result["W2_F_TERM1_S"],
-                          result["W2_F_TERM2_CS"], result["W2_F_TERM2_C"], result["W2_F_TERM2_S"],
-                          result["W2_F_TERM3_CS"], result["W2_F_TERM3_C"], result["W2_F_TERM3_S"])
-        w3 = w3_inference(pdbs, pdb_names, result["W3_F_TERM1_CS"], result["W3_F_TERM1_C"], result["W3_F_TERM1_S"],
-                          result["W3_F_TERM2_CS"], result["W3_F_TERM2_C"], result["W3_F_TERM2_S"])
-        w4 = w4_inference(pdbs, pdb_names, result["W4_F_TERM1_CS"], result["W4_F_TERM1_C"], result["W4_F_TERM1_S"],
-                          result["W4_F_TERM2_CS"], result["W4_F_TERM2_C"], result["W4_F_TERM2_S"])
-        w5 = w5_inference(pdbs, pdb_names, result["W5_F_TERM1_CS"], result["W5_F_TERM1_C"], result["W5_F_TERM1_S"])
-        w6 = w6_inference(pdbs, pdb_names, result["W6_F_TERM1_CS"], result["W6_F_TERM1_C"], result["W6_F_TERM1_S"])
+        w1 = w1_inference(pdbs, pdb_names, statistical_potentials["W1_F_TERM1_CS"], 
+                          statistical_potentials["W1_F_TERM1_C"], 
+                          statistical_potentials["W1_F_TERM1_S"])
+        w2 = w2_inference(pdbs, pdb_names, statistical_potentials["W2_F_TERM1_CS"], 
+                          statistical_potentials["W2_F_TERM1_C"], statistical_potentials["W2_F_TERM1_S"],
+                          statistical_potentials["W2_F_TERM2_CS"], statistical_potentials["W2_F_TERM2_C"], 
+                          statistical_potentials["W2_F_TERM2_S"], statistical_potentials["W2_F_TERM3_CS"],
+                          statistical_potentials["W2_F_TERM3_C"], statistical_potentials["W2_F_TERM3_S"])
+        w3 = w3_inference(pdbs, pdb_names, statistical_potentials["W3_F_TERM1_CS"], statistical_potentials["W3_F_TERM1_C"], 
+                          statistical_potentials["W3_F_TERM1_S"], statistical_potentials["W3_F_TERM2_CS"], 
+                          statistical_potentials["W3_F_TERM2_C"], statistical_potentials["W3_F_TERM2_S"])
+        w4 = w4_inference(pdbs, pdb_names, statistical_potentials["W4_F_TERM1_CS"], statistical_potentials["W4_F_TERM1_C"], 
+                          statistical_potentials["W4_F_TERM1_S"], statistical_potentials["W4_F_TERM2_CS"], 
+                          statistical_potentials["W4_F_TERM2_C"], statistical_potentials["W4_F_TERM2_S"])
+        w5 = w5_inference(pdbs, pdb_names, statistical_potentials["W5_F_TERM1_CS"], statistical_potentials["W5_F_TERM1_C"], 
+                          statistical_potentials["W5_F_TERM1_S"])
+        w6 = w6_inference(pdbs, pdb_names, statistical_potentials["W6_F_TERM1_CS"], statistical_potentials["W6_F_TERM1_C"], 
+                          statistical_potentials["W6_F_TERM1_S"])
 
-        result[f"w1-{dataset_name}"] = w1
-        result[f"w2-{dataset_name}"] = w2
-        result[f"w3-{dataset_name}"] = w3
-        result[f"w4-{dataset_name}"] = w4
-        result[f"w5-{dataset_name}"] = w5
-        result[f"w6-{dataset_name}"] = w6
+        result[f"w1-{dataset}"] = w1
+        result[f"w2-{dataset}"] = w2
+        result[f"w3-{dataset}"] = w3
+        result[f"w4-{dataset}"] = w4
+        result[f"w5-{dataset}"] = w5
+        result[f"w6-{dataset}"] = w6
 
     return result
