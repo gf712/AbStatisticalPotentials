@@ -1,3 +1,4 @@
+from glob import glob
 import math
 import numpy as np
 from collections import defaultdict
@@ -7,6 +8,7 @@ import mdtraj as md
 import json
 import itertools
 from abc import ABC, abstractmethod
+import copy
 
 # https://www.sciencedirect.com/science/article/pii/S1476927114001698
 Residue_opt_ref_asa = {
@@ -44,8 +46,6 @@ BOLTZMANN_CONSTANT = constants.Boltzmann
 DIST_BINS = np.append(np.arange(3, 8.2, 0.2), (np.inf,)) 
 SASA_BINS = [0.05, 0.2, 0.4, 0.55, math.inf]
 
-GLOBAL_CACHE = dict()
-
 
 def to_probabilities(dict_a):
     """Converts a dictionary with observed frequencies to 
@@ -64,13 +64,11 @@ def compute_dssp(pdb):
     return ['L' if el==' ' else el for el in dssp]
 
 
-def inverse_boltzmann(frequency_cs, frequency_c, frequency_s):
+def inverse_boltzmann(observed, expected):
     """ Inverse Boltzmann law:
-    -k * T * log(frac{F(c,s), F(s) * F(c)})
+    -k * T * log(frac{F(observed)/F(expected)})
     """
-    return -BOLTZMANN_CONSTANT * 310.15 * math.log(
-            frequency_cs / (frequency_c * frequency_s)
-        )
+    return -BOLTZMANN_CONSTANT * 310.15 * math.log(observed / expected)
 
 
 def compute_bin(val, bins):
@@ -98,23 +96,46 @@ def compute_sidechain_pdist(pdb):
 
     return sidechain_pdist
 
+def serialize_numpy_to_string(array):
+    result = []
+    for val in array:
+        if val == np.inf:
+            result.append("np.inf")
+        else:
+            result.append(str(val))
+    result[0] = "np.array([" + result[0]
+    result[-1] = result[-1] + "])"
+    return ','.join(result)
+
+
 class Heuristic(ABC):
-    def __init__(self, name, pdbs, position):
+    """A stateful class that computes a given heuristic
+    for all given mdtraj.Trajectory objects.
+    """
+    def __init__(self, name, pdbs, position, value_set):
         if position not in ['i', 'j', 'ij']:
             raise ValueError("Expeceted position to be either i, j or ij.")
         self._name = name
         self._pdbs = pdbs
-        self._count = len(pdbs)
         # using list as cache (instead of dict) as hash(pdb) does not always work
-        self.cache = [0] * len(pdbs)
         self._position = position
+        self._value_set = value_set
+        self._initialize()
     
     @abstractmethod
     def _compute(self, pdb):
         raise NotImplementedError("Abstract method")
 
+    @abstractmethod
+    def serialization_name(self):
+        raise NotImplementedError("Abstract method")
+
+    def _initialize(self):
+        self._count = len(self._pdbs)
+        self.cache = [None] * len(self._pdbs)
+
     def compute(self, i):
-        if isinstance(self.cache[i], int) and self.cache[i] == 0:
+        if self.cache[i] is None:
             result = self._compute(self._pdbs[i])
             self.cache[i] = result
         return self.cache[i]
@@ -124,6 +145,16 @@ class Heuristic(ABC):
         for i in range(len(self._pdbs)):
             result.append(self.compute(i))
         return result
+
+    def clone_with(self, pdbs):
+        """Clones the object with using the same attributes
+        but replaces with another set of pdb structures and
+        resets the state, e.g. new cache
+        """
+        new_obj = copy.copy(self)
+        new_obj.__dict__['_pdbs'] = pdbs
+        new_obj._initialize()
+        return new_obj
 
     @property
     def name(self):
@@ -136,12 +167,16 @@ class Heuristic(ABC):
     @property
     def count(self):
         return self._count
-    
+
+    @property
+    def value_set(self):
+        return self._value_set
+
     
 class SidechainPdistHeuristic(Heuristic):
 
     def __init__(self, name, pdbs, bins, cutoff):
-        super().__init__(name, pdbs, "ij")
+        super().__init__(name, pdbs, "ij", [str(x) for x in range(len(bins))])
         self._bins = bins
         self._cutoff = cutoff
 
@@ -155,11 +190,14 @@ class SidechainPdistHeuristic(Heuristic):
                     result[j, i] = result[i, j]
         return result
 
+    def serialization_name(self):
+        return f"SidechainPdistHeuristic('{self._name}', PDBS, {serialize_numpy_to_string(self._bins)}, {self._cutoff})"
+
 
 class DSSPHeuristic(Heuristic):
 
     def __init__(self, name, pdbs, cutoff, position):
-        super().__init__(name, pdbs, position)
+        super().__init__(name, pdbs, position, ['H', 'B', 'E', 'G', 'I', 'T', 'S', 'L'])
         self._cutoff = cutoff
 
     def _compute(self, pdb):
@@ -170,16 +208,17 @@ class DSSPHeuristic(Heuristic):
             upper_bound = min(i+self._cutoff, len(dssp))
             for j in range(lower_bound, upper_bound):
                 result[i, j] = dssp[j]
-                # result[j, i] = dssp[j]
             result[i, i] = dssp[i]
 
         return result
 
+    def serialization_name(self):
+        return f"DSSPHeuristic('{self._name}', PDBS, {self._cutoff}, '{self._position}')"
 
 class SASAHeuristic(Heuristic):
 
-    def __init__(self, name, pdbs, cutoff, position):
-        super().__init__(name, pdbs, position)
+    def __init__(self, name, pdbs, bins, cutoff, position):
+        super().__init__(name, pdbs, position, [str(x) for x in range(len(bins))])
         self._cutoff = cutoff
 
     def _compute(self, pdb):
@@ -193,29 +232,34 @@ class SASAHeuristic(Heuristic):
                 ratio = compute_bin(sasa[j] / Residue_opt_ref_asa[resnames[j]], self._bins)
                 bin_i = compute_bin(ratio, bins)
                 result[i, j] = ratio
-            ratio = compute_bin(sasa[i] / Residue_opt_ref_asa[resnames[i]], self._bins)
-            result[i, i] = ratio
-                # result[j, i] = compute_bin(sasa[j] / Residue_opt_ref_asa[resnames[j]], self._bins)
+            result[i, i] = compute_bin(sasa[i] / Residue_opt_ref_asa[resnames[i]], self._bins)
 
         return result
 
+    def serialization_name(self):
+        return f"SASAHeuristic('{self._name}', PDBS, {serialize_numpy_to_string(self._bins)}, {self._cutoff}, '{self._position}')"
 
-class AAPHeuristic(Heuristic):
+
+class AAHeuristic(Heuristic):
 
     def __init__(self, name, pdbs, cutoff, position):
-        super().__init__(name, pdbs, position)
+        super().__init__(name, pdbs, position, AA_LIST)
         self._cutoff = cutoff
 
     def _compute(self, pdb):
-        resnames = [res.name for res in pdb.residues]
+        resnames = [res.name for res in pdb.top.residues]
         result = np.full((len(resnames), len(resnames)), np.NaN, dtype="<U3")
         for i in range(result.shape[0]):
             lower_bound = max(0, i-self._cutoff)
-            upper_bound = min(i+self._cutoff, len(dssp))
+            upper_bound = min(i+self._cutoff, len(resnames))
             for j in range(lower_bound, upper_bound):
                 result[i, j] = resnames[j]
             result[i, i] = resnames[i]
         return result
+
+    def serialization_name(self):
+        return f"AAHeuristic('{self._name}', PDBS, {self._cutoff}, {self._position})"
+
 
 class CombinedHeuristics:
     def __init__(self, heuristics):
@@ -223,35 +267,52 @@ class CombinedHeuristics:
         if len(count) != 1:
             raise ValueError("Expected all heuristic objects to own the same number of structs")
         self._heuristics = heuristics
-        self._cache = dict()
         self._count = count.pop()
+        self._cache = [None] * self._count
 
-    def get_frequencies(self):
-        if (len(self._cache) == 0):
-            result = defaultdict(int)
-            for struct_i in range(self._count):
-                h_results = [h.compute(struct_i) for h in self._heuristics]
-                for i in range(h_results[0].shape[0]):
-                    for j in range(i+1, h_results[0].shape[0]):
-                        failed = False
-                        key = []
-                        for h_i, h in enumerate(self._heuristics):
-                            # check if res_i and res_j are available for this computation
-                            val_ij = h_results[h_i][i, j]
-                            if is_nan(val_ij):
-                                failed = True
-                                break
-                            # if available we can store the value of i or j or ij 
-                            # depending on heuristic
-                            if h.position == 'i':
-                                key.append(str(h_results[h_i][i, i]))
-                            else:
-                                key.append(val_ij)
+    def compute_frequency(self, idx):
+        result = defaultdict(int)
 
-                        if not failed:
-                            result['-'.join(key)] += 1
-            self._cache = result
-        return self._cache
+        if self._cache[idx] is None:
+            h_results = [h.compute(idx) for h in self._heuristics]
+            for i in range(h_results[0].shape[0]):
+                for j in range(i+1, h_results[0].shape[0]):
+                    failed = False
+                    key = []
+                    for h_i, h in enumerate(self._heuristics):
+                        # check if res_i and res_j are available for this computation
+                        val_ij = h_results[h_i][i, j]
+                        if is_nan(val_ij):
+                            failed = True
+                            break
+                        # if available we can store the value of i or j or ij 
+                        # depending on heuristic
+                        if h.position == 'i':
+                            key.append(str(h_results[h_i][i, i]))
+                        else:
+                            key.append(val_ij)
+
+                    if not failed:
+                        result['-'.join(key)] += 1
+            self._cache[idx] = result
+        return self._cache[idx]
+
+    def compute_frequencies(self):
+        result_list = list()
+        result = defaultdict(int)
+        for struct_i in range(self._count):
+            result_list.append(self.compute_frequency(struct_i))
+        for result_i in result_list:
+            for k, v in result_i.items():
+                result[k] += v
+        return {k: float(v) / self._count for k, v in result.items()}
+
+    def clone_with(self, pdbs):
+        """Clones CombinedHeuristics which uses
+        pdbs internally.
+        """
+        new_h = [h.clone_with(pdbs) for h in self._heuristics]
+        return CombinedHeuristics(new_h)
 
     def serialize(self):
         """Serialize object
@@ -264,7 +325,7 @@ class CombinedHeuristics:
 
     @property
     def name(self):
-        return f"CombinedHeuristics({'-'.join([h.name for h in self._heuristics])})"
+        return f"CombinedHeuristics({', '.join([h.name for h in self._heuristics])})"
     
     def __repr__(self):
         return self.name
@@ -275,7 +336,13 @@ class CombinedHeuristics:
         of all Heuristic objects.
         """
         return hash(''.join([h.name for h in self._heuristics]))
-    
+
+    def __eq__(self, other):
+        if not isinstance(other, CombinedHeuristics):
+            raise ValueError("Expected another CombinedHeuristics object.")
+        return all(this_name == other_name for this_name, other_name in zip([h.name for h in self._heuristics],
+            [h.name for h in other._heuristics]))
+
 
 def debug_approx_w(c):
     """Function to get w approximation calculation
@@ -283,12 +350,13 @@ def debug_approx_w(c):
     """
     upper = []
     lower = []
+    flatten = lambda l: [item for sublist in l for item in sublist]
     for x in range(1, len(c)+1):
         if x % 2 == 1:
-            upper.append([f"P({''.join(i)})" for i in itertools.combinations(c, r=x)])
+            upper.append([f"P({', '.join(i)})" for i in itertools.combinations(c, r=x)])
         else:
-            lower.append([f"P({''.join(i)})" for i in itertools.combinations(c, r=x)])
-    return '*'.join(flatten(upper))+' / '+'*'.join(flatten(lower))
+            lower.append([f"P({', '.join(i)})" for i in itertools.combinations(c, r=x)])
+    return f"({'*'.join(flatten(upper))}) / ({'*'.join(flatten(lower))})"
 
 
 def debug_compute_w(c):
@@ -298,27 +366,66 @@ def debug_compute_w(c):
     computations = list()
     for i in range(2, len(c)+1):
         for approx_c_i in itertools.combinations(c, r=i):
-            computations.append(approx_w(approx_c_i))
+            computations.append(debug_approx_w(approx_c_i))
     return ' +\n'.join(computations)
 
 
-def approx_w_heuristics(h):
-    if len(h) < 2:
-        raise ValueError("Expected h to be a dict with two or more entries.")
-    upper = list()
-    lower = list()
-    for x in range(1, len(h) + 1):
-        if x % 2 == 1:
-            upper.extend([CombinedHeuristics(combo) for combo in itertools.combinations(h, r=x)])
-        else:
-            lower.extend([CombinedHeuristics(combo) for combo in itertools.combinations(h, r=x)])
-    return upper, lower
+class ApproximateStatisticalPotential:
+    def __init__(self, heuristics):
+        self._heuristics = heuristics
+        self._upper_computations, self._lower_computations, self._upper_idx, self._lower_idx = \
+            self.approx_w_heuristics(heuristics)
+        self._name = f"sp_{'_'.join(x.name for x in self._heuristics)}"
+
+    def possible_element_combinations(self):
+        return itertools.product(*[h.value_set for h in self._heuristics], repeat=1)
+
+    def serialization_name(self):
+        return '|'.join(x.serialization_name() for x in self._heuristics)
+
+    @property
+    def upper_computations(self):
+        return self._upper_computations
+        
+    @property
+    def lower_computations(self):
+        return self._lower_computations
+
+    @property
+    def upper_idx(self):
+        return self._upper_idx
+    
+    @property
+    def lower_idx(self):
+        return self._lower_idx
+    
+    @property
+    def name(self):
+        return self._name
+    
+    @staticmethod
+    def approx_w_heuristics(h):
+        if len(h) < 2:
+            raise ValueError("Expected h to be a dict with two or more entries.")
+        upper = list()
+        lower = list()
+        upper_idx = list()
+        lower_idx = list()
+        for x in range(1, len(h) + 1):
+            if x % 2 == 1:
+                upper.extend([CombinedHeuristics(combo) for combo in itertools.combinations(h, r=x)])
+                [upper_idx.append(combo) for combo in itertools.combinations(range(len(h)), r=x)]
+            else:
+                lower.extend([CombinedHeuristics(combo) for combo in itertools.combinations(h, r=x)])
+                [lower_idx.append(combo) for combo in itertools.combinations(range(len(h)), r=x)]
+
+        return upper, lower, upper_idx, lower_idx
 
 def w_heuristics(h):
     computations = list()
     for i in range(2, len(h) + 1):
         for approx_c_i in itertools.combinations(h, r=i):
-            computations.append(approx_w_heuristics(approx_c_i))
+            computations.append(ApproximateStatisticalPotential(approx_c_i))
     return computations
 
 
@@ -333,22 +440,147 @@ def get_kwargs(name, kwargs):
         raise ValueError(f"Expected {name} in kwargs.")
     return kwargs[name]
 
-
-def compute_heuristics(computation_list, serialize=True, **kwargs):
-    result = []
-    for e in computation_list:
-        result_i = []
-        for subexpression in e:
-            for term in subexpression:
-                if term not in GLOBAL_CACHE:
-                    GLOBAL_CACHE[term] = term.get_frequencies()
-                if serialize:
-                    path = f"{get_kwargs("path", kwargs)}/{get_kwargs("set_name", kwargs)}-{term.name}.json"
-                    serialize(GLOBAL_CACHE[term], path)
-                result_i.append(GLOBAL_CACHE[term])
-        result.append(result_i)
+def frequency_computation_helper(subexpression, cache):
+    result = list()
+    for term in subexpression:
+        if term not in cache:                    
+            cache[term] = term.compute_frequencies()
+        result.append(cache[term])
     return result
 
+def single_struct_frequency_computation_helper(subexpression, idx):
+    result = list()
+    for term in subexpression:
+        result.append(term.compute_frequency(idx))
+    return result
+
+
+def estimate_inverse_boltzmann_helper(statistical_potential, serialize=True, **kwargs):
+    result = list()
+
+    for e in statistical_potential._approximate_sp:
+        result_i = dict()
+        # observed
+        upper_computations = frequency_computation_helper(e.upper_computations, 
+                                                          statistical_potential._cache)
+        # expected
+        lower_computations = frequency_computation_helper(e.lower_computations, 
+                                                          statistical_potential._cache)
+
+        upper_inverse_boltzmann = dict()
+        lower_inverse_boltzmann = dict()
+
+        for combo in e.possible_element_combinations():
+            upper_product = 1.0
+            lower_product = 1.0
+            for upper_term, upper_term_idx in zip(upper_computations, e.upper_idx):
+                key = '-'.join(combo[idx] for idx in upper_term_idx)
+                if key in upper_term:
+                    upper_product *= upper_term[key]
+            for lower_term, lower_term_idx in zip(lower_computations, e.lower_idx):
+                key = '-'.join(combo[idx] for idx in lower_term_idx)
+                if key in lower_term:
+                    lower_product *= lower_term[key]
+
+            result_i['-'.join(combo)] = inverse_boltzmann(upper_product, lower_product)
+
+        if serialize:
+            path = f"{get_kwargs('path', kwargs)}/inverse_boltzmann-{get_kwargs('set_name', kwargs)}-{e.name}.json"
+            serialize_json(result_i, path)
+        result.append(result_i)
+
+    return result
+
+
+def compute_inverse_boltzmann_helper(statistical_potential, inverse_boltzmann_values, pdbs):
+
+    new_h = [x.clone_with(pdbs) for x in statistical_potential._heuristics]
+    new_sp = StatisticalPotential(*new_h)
+    result = list()
+
+    for idx in range(len(pdbs)):
+        for e, approx_boltzmann in zip(new_sp._approximate_sp,inverse_boltzmann_values):
+            result_i = 0
+            hs = CombinedHeuristics(e._heuristics)
+            freq = hs.compute_frequency(idx)
+            for k, v in freq.items():
+                result_i += approx_boltzmann[k] * v
+        result.append(result_i)
+
+    return result
+
+class StatisticalPotential:
+    def __init__(self, *args):
+        if len(args) < 2:
+            raise ValueError(f"Expected at least two heuristics, but got {len(args)}.")
+        self._heuristics = args
+        self._approximate_sp = w_heuristics(self._heuristics)
+        self._cache = dict()
+        self._computation_string = debug_compute_w([x.name for x in self._heuristics])
+        self._estimated_inverse_boltzmann = None
+
+    def possible_element_combinations(self):
+        return itertools.product(*[h.value_set for h in self._heuristics], repeat=1)
+
+    def estimate_inverse_boltzmann(self):
+        """Estimates the inverse Boltzmann for each term in
+        the statistical potential estimation expansion.
+        See self.computation_string to see what each term represents.
+        """
+        if self._estimated_inverse_boltzmann is None:
+            self._estimated_inverse_boltzmann = estimate_inverse_boltzmann_helper(self, serialize=False)
+        return self._estimated_inverse_boltzmann
+
+    def compute_inverse_boltzmann(self, pdbs):
+        if self._estimated_inverse_boltzmann is None:
+            raise ValueError("Call the `estimate_inverse_boltzmann` method before running `compute_inverse_boltzmann`!")
+        return compute_inverse_boltzmann_helper(self, self._estimated_inverse_boltzmann, pdbs)
+
+    def serialize(self, path, set_name):
+        """Serialize inverse Boltzmann value estimations
+        """
+        estimate_inverse_boltzmann_helper(self, serialize=True, path=path, set_name=set_name)
+        with open(f"{path}/inverse_boltzmann-{set_name}-info.txt", "w") as f:
+            f.write(
+                    '\n'.join(h.serialization_name() for h in self._heuristics)
+                )
+
+    @staticmethod
+    def deserialize(path, set_name, pdbs):
+        """Deserialize inverse Boltzmann value estimations and
+        return a new object with these loaded values.
+        """
+        files = glob(f"{path}/inverse_boltzmann-*.json")
+        info_file = f"{path}/inverse_boltzmann-{set_name}-info.txt"
+        hs = list()
+        with open(info_file, 'r') as f:
+            for line in f:
+                hs.append(line.rstrip())
+
+        hs_instances = list()
+        for x in hs:
+            print(x.replace("PDBS", "pdbs"))
+            hs_instances.append(eval(x.replace("PDBS", "pdbs")))
+
+        sp = StatisticalPotential(*hs_instances)     
+        
+        boltzmann_values = list()
+        for approx_boltzmann in sp._approximate_sp:
+            name = approx_boltzmann.name
+            filename = f"{path}/inverse_boltzmann-{set_name}-{name}.json" 
+            if filename not in files:
+                raise ValueError(f"Expected file {filename} not found.")
+
+            boltzmann_values.append(deserialize_json(filename))
+
+        sp._estimated_inverse_boltzmann = boltzmann_values
+        
+        return sp
+
+    @property
+    def computation_string(self):
+        return self._computation_string
+    
 
 # All the routines for approximating the statistical potentials of a dataset and
 # the corresponding functions to infer the energetic contribution of any protein
@@ -772,7 +1004,7 @@ def w6_inference(pdbs, names,
     return results
 
 
-def serialize(var, name):
+def serialize_json(var, name):
     """Helper function to serialise a Python dictionary in
     JSON format. Handles opening and closing file.
     """
@@ -780,7 +1012,7 @@ def serialize(var, name):
         json.dump(var, f)
 
 
-def deserialize(path):
+def deserialize_json(path):
     result = {}
     with open(path, "r") as f:
         result = json.load(f)
@@ -838,46 +1070,46 @@ def compute_statistical_potential(pdbs, dataset_path, dataset_name):
     results["W6_F_TERM1_S"]  = to_probabilities(w6[2])
     
     for name, w in results.items():
-        serialize(w, f"{dataset_path}/{name}-{dataset_name}.json")
+        serialize_json(w, f"{dataset_path}/{name}-{dataset_name}.json")
 
 
 def get_statistical_potentials(dataset_path, dataset_name):
     result = dict()
-    result["W1_F_TERM1_CS"] = deserialize(f"{dataset_path}/W1_F_TERM1_CS-{dataset_name}.json")
-    result["W1_F_TERM1_C"]  = deserialize(f"{dataset_path}/W1_F_TERM1_C-{dataset_name}.json")
-    result["W1_F_TERM1_S"]  = deserialize(f"{dataset_path}/W1_F_TERM1_S-{dataset_name}.json")
+    result["W1_F_TERM1_CS"] = deserialize_json(f"{dataset_path}/W1_F_TERM1_CS-{dataset_name}.json")
+    result["W1_F_TERM1_C"]  = deserialize_json(f"{dataset_path}/W1_F_TERM1_C-{dataset_name}.json")
+    result["W1_F_TERM1_S"]  = deserialize_json(f"{dataset_path}/W1_F_TERM1_S-{dataset_name}.json")
     
-    result["W2_F_TERM1_CS"] = deserialize(f"{dataset_path}/W2_F_TERM1_CS-{dataset_name}.json")
-    result["W2_F_TERM1_C"]  = deserialize(f"{dataset_path}/W2_F_TERM1_C-{dataset_name}.json")
-    result["W2_F_TERM1_S"]  = deserialize(f"{dataset_path}/W2_F_TERM1_S-{dataset_name}.json")
-    result["W2_F_TERM2_CS"] = deserialize(f"{dataset_path}/W2_F_TERM2_CS-{dataset_name}.json")
-    result["W2_F_TERM2_C"]  = deserialize(f"{dataset_path}/W2_F_TERM2_C-{dataset_name}.json")
-    result["W2_F_TERM2_S"]  = deserialize(f"{dataset_path}/W2_F_TERM2_S-{dataset_name}.json")
-    result["W2_F_TERM3_CS"] = deserialize(f"{dataset_path}/W2_F_TERM3_CS-{dataset_name}.json")
-    result["W2_F_TERM3_C"]  = deserialize(f"{dataset_path}/W2_F_TERM3_C-{dataset_name}.json")
-    result["W2_F_TERM3_S"]  = deserialize(f"{dataset_path}/W2_F_TERM3_S-{dataset_name}.json")
+    result["W2_F_TERM1_CS"] = deserialize_json(f"{dataset_path}/W2_F_TERM1_CS-{dataset_name}.json")
+    result["W2_F_TERM1_C"]  = deserialize_json(f"{dataset_path}/W2_F_TERM1_C-{dataset_name}.json")
+    result["W2_F_TERM1_S"]  = deserialize_json(f"{dataset_path}/W2_F_TERM1_S-{dataset_name}.json")
+    result["W2_F_TERM2_CS"] = deserialize_json(f"{dataset_path}/W2_F_TERM2_CS-{dataset_name}.json")
+    result["W2_F_TERM2_C"]  = deserialize_json(f"{dataset_path}/W2_F_TERM2_C-{dataset_name}.json")
+    result["W2_F_TERM2_S"]  = deserialize_json(f"{dataset_path}/W2_F_TERM2_S-{dataset_name}.json")
+    result["W2_F_TERM3_CS"] = deserialize_json(f"{dataset_path}/W2_F_TERM3_CS-{dataset_name}.json")
+    result["W2_F_TERM3_C"]  = deserialize_json(f"{dataset_path}/W2_F_TERM3_C-{dataset_name}.json")
+    result["W2_F_TERM3_S"]  = deserialize_json(f"{dataset_path}/W2_F_TERM3_S-{dataset_name}.json")
     
-    result["W3_F_TERM1_CS"] = deserialize(f"{dataset_path}/W3_F_TERM1_CS-{dataset_name}.json")
-    result["W3_F_TERM1_C"]  = deserialize(f"{dataset_path}/W3_F_TERM1_C-{dataset_name}.json")
-    result["W3_F_TERM1_S"]  = deserialize(f"{dataset_path}/W3_F_TERM1_S-{dataset_name}.json")
-    result["W3_F_TERM2_CS"] = deserialize(f"{dataset_path}/W3_F_TERM2_CS-{dataset_name}.json")
-    result["W3_F_TERM2_C"]  = deserialize(f"{dataset_path}/W3_F_TERM2_C-{dataset_name}.json")
-    result["W3_F_TERM2_S"]  = deserialize(f"{dataset_path}/W3_F_TERM2_S-{dataset_name}.json")
+    result["W3_F_TERM1_CS"] = deserialize_json(f"{dataset_path}/W3_F_TERM1_CS-{dataset_name}.json")
+    result["W3_F_TERM1_C"]  = deserialize_json(f"{dataset_path}/W3_F_TERM1_C-{dataset_name}.json")
+    result["W3_F_TERM1_S"]  = deserialize_json(f"{dataset_path}/W3_F_TERM1_S-{dataset_name}.json")
+    result["W3_F_TERM2_CS"] = deserialize_json(f"{dataset_path}/W3_F_TERM2_CS-{dataset_name}.json")
+    result["W3_F_TERM2_C"]  = deserialize_json(f"{dataset_path}/W3_F_TERM2_C-{dataset_name}.json")
+    result["W3_F_TERM2_S"]  = deserialize_json(f"{dataset_path}/W3_F_TERM2_S-{dataset_name}.json")
     
-    result["W4_F_TERM1_CS"] = deserialize(f"{dataset_path}/W4_F_TERM1_CS-{dataset_name}.json")
-    result["W4_F_TERM1_C"]  = deserialize(f"{dataset_path}/W4_F_TERM1_C-{dataset_name}.json")
-    result["W4_F_TERM1_S"]  = deserialize(f"{dataset_path}/W4_F_TERM1_S-{dataset_name}.json")
-    result["W4_F_TERM2_CS"] = deserialize(f"{dataset_path}/W4_F_TERM2_CS-{dataset_name}.json")
-    result["W4_F_TERM2_C"]  = deserialize(f"{dataset_path}/W4_F_TERM2_C-{dataset_name}.json")
-    result["W4_F_TERM2_S"]  = deserialize(f"{dataset_path}/W4_F_TERM2_S-{dataset_name}.json")
+    result["W4_F_TERM1_CS"] = deserialize_json(f"{dataset_path}/W4_F_TERM1_CS-{dataset_name}.json")
+    result["W4_F_TERM1_C"]  = deserialize_json(f"{dataset_path}/W4_F_TERM1_C-{dataset_name}.json")
+    result["W4_F_TERM1_S"]  = deserialize_json(f"{dataset_path}/W4_F_TERM1_S-{dataset_name}.json")
+    result["W4_F_TERM2_CS"] = deserialize_json(f"{dataset_path}/W4_F_TERM2_CS-{dataset_name}.json")
+    result["W4_F_TERM2_C"]  = deserialize_json(f"{dataset_path}/W4_F_TERM2_C-{dataset_name}.json")
+    result["W4_F_TERM2_S"]  = deserialize_json(f"{dataset_path}/W4_F_TERM2_S-{dataset_name}.json")
     
-    result["W5_F_TERM1_CS"] = deserialize(f"{dataset_path}/W5_F_TERM1_CS-{dataset_name}.json")
-    result["W5_F_TERM1_C"]  = deserialize(f"{dataset_path}/W5_F_TERM1_C-{dataset_name}.json")
-    result["W5_F_TERM1_S"]  = deserialize(f"{dataset_path}/W5_F_TERM1_S-{dataset_name}.json")
+    result["W5_F_TERM1_CS"] = deserialize_json(f"{dataset_path}/W5_F_TERM1_CS-{dataset_name}.json")
+    result["W5_F_TERM1_C"]  = deserialize_json(f"{dataset_path}/W5_F_TERM1_C-{dataset_name}.json")
+    result["W5_F_TERM1_S"]  = deserialize_json(f"{dataset_path}/W5_F_TERM1_S-{dataset_name}.json")
     
-    result["W6_F_TERM1_CS"] = deserialize(f"{dataset_path}/W6_F_TERM1_CS-{dataset_name}.json")
-    result["W6_F_TERM1_C"]  = deserialize(f"{dataset_path}/W6_F_TERM1_C-{dataset_name}.json")
-    result["W6_F_TERM1_S"]  = deserialize(f"{dataset_path}/W6_F_TERM1_S-{dataset_name}.json")
+    result["W6_F_TERM1_CS"] = deserialize_json(f"{dataset_path}/W6_F_TERM1_CS-{dataset_name}.json")
+    result["W6_F_TERM1_C"]  = deserialize_json(f"{dataset_path}/W6_F_TERM1_C-{dataset_name}.json")
+    result["W6_F_TERM1_S"]  = deserialize_json(f"{dataset_path}/W6_F_TERM1_S-{dataset_name}.json")
 
     return result
 
