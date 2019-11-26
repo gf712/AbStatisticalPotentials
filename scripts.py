@@ -1,6 +1,15 @@
 import json
 import numpy as np
 import mdtraj as md
+from statistical_potentials.definitions import *
+from statistical_potentials.io_helpers import deserialize_json, serialize_json
+from statistical_potentials.heuristic_helpers import *
+from statistical_potentials.math_helpers import compute_bin
+
+
+def inverse_boltzmann(a, b, c):
+    return -BOLTZMANN_CONSTANT * 310.15 * math.log(a * b / c)
+
 
 
 def w1_calculation(pdbs):

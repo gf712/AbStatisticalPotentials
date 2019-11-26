@@ -57,6 +57,20 @@ class Heuristic(ABC):
         new_obj._initialize()
         return new_obj
 
+
+    def __eq__(self, other):
+        return (self._name == other._name) and (self._position == other._position) and (self._value_set == other._value_set)
+
+
+    def __hash__(self):
+        # if boost_combine was python code
+        hash_value = hash(self._name)
+        hash_value ^= hash(self._position) + 0x9e3779b9 + (hash_value << 6) + (hash_value >> 2)
+        hash_value ^= hash(self._value_set) + 0x9e3779b9 + (hash_value << 6) + (hash_value >> 2);
+
+        return hash_value
+
+
     @property
     def name(self):
         return self._name + self._position
