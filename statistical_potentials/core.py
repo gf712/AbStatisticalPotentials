@@ -10,45 +10,12 @@ from .math_helpers import inverse_boltzmann
 from .io_helpers import serialize_json, deserialize_json
 from .heuristics import *
 
-def debug_approx_w(c):
-    """Function to get w approximation calculation
-    in a readable string format.
-    """
-    upper = []
-    lower = []
-    flatten = lambda l: [item for sublist in l for item in sublist]
-    for x in range(1, len(c)+1):
-        if x % 2 == 1:
-            upper.append([f"P({', '.join(i)})" for i in itertools.combinations(c, r=x)])
-        else:
-            lower.append([f"P({', '.join(i)})" for i in itertools.combinations(c, r=x)])
-    return f"({'*'.join(flatten(upper))}) / ({'*'.join(flatten(lower))})"
-
-
-def debug_compute_w(c):
-    """Function to get w calculation
-    in a readable string format.
-    """
-    computations = list()
-    for i in range(2, len(c)+1):
-        for approx_c_i in itertools.combinations(c, r=i):
-            computations.append(debug_approx_w(approx_c_i))
-    return ' +\n'.join(computations)
-
-
-
-def w_heuristics(h):
-    computations = list()
-    for i in range(2, len(h) + 1):
-        for approx_c_i in itertools.combinations(h, r=i):
-            computations.append(ApproximateStatisticalPotential(approx_c_i))
-    return computations
 
 class StatisticalPotential:
     def __init__(self, *args):
         if len(args) < 2:
             raise ValueError(f"Expected at least two heuristics, but got {len(args)}.")
-        self._heuristics = args
+        self._heuristics = list(args)
         self._approximate_sp = w_heuristics(self._heuristics)
         self._cache = dict()
         self._computation_string = debug_compute_w([x.name for x in self._heuristics])
@@ -116,6 +83,41 @@ class StatisticalPotential:
     @property
     def computation_string(self):
         return self._computation_string
+
+
+def debug_approx_w(c):
+    """Function to get w approximation calculation
+    in a readable string format.
+    """
+    upper = []
+    lower = []
+    flatten = lambda l: [item for sublist in l for item in sublist]
+    for x in range(1, len(c)+1):
+        if x % 2 == 1:
+            upper.append([f"P({', '.join(i)})" for i in itertools.combinations(c, r=x)])
+        else:
+            lower.append([f"P({', '.join(i)})" for i in itertools.combinations(c, r=x)])
+    return f"({'*'.join(flatten(upper))}) / ({'*'.join(flatten(lower))})"
+
+
+def debug_compute_w(c):
+    """Function to get w calculation
+    in a readable string format.
+    """
+    computations = list()
+    for i in range(2, len(c)+1):
+        for approx_c_i in itertools.combinations(c, r=i):
+            computations.append(debug_approx_w(approx_c_i))
+    return ' +\n'.join(computations)
+
+
+def w_heuristics(h):
+    computations = list()
+    for i in range(2, len(h) + 1):
+        for approx_c_i in itertools.combinations(h, r=i):
+            computations.append(ApproximateStatisticalPotential(approx_c_i))
+    return computations
+
     
 def frequency_computation_helper(subexpression, cache):
     result = list()
@@ -148,6 +150,11 @@ def estimate_inverse_boltzmann_helper(statistical_potential, serialize=True, **k
         lower_inverse_boltzmann = dict()
 
         for combo in e.possible_element_combinations():
+            # normalised epsilon, in the literature this value is either 10 or
+            # 20 but the computations become too complex to determine which value to use
+            # so just use 15 here
+            epsilon = 15. / e.upper_computations[0]._count
+            total_count = e.upper_computations[0]._count
             upper_product = 1.0
             lower_product = 1.0
             for upper_term, upper_term_idx in zip(upper_computations, e.upper_idx):
@@ -159,7 +166,8 @@ def estimate_inverse_boltzmann_helper(statistical_potential, serialize=True, **k
                 if key in lower_term:
                     lower_product *= lower_term[key]
 
-            result_i['-'.join(combo)] = inverse_boltzmann(upper_product, lower_product)
+            result_i['-'.join(combo)] = inverse_boltzmann((lower_product+upper_product)/(epsilon+lower_product),
+                                                          lower_product)
 
         if serialize:
             directory = get_kwargs('path', kwargs)
@@ -190,3 +198,25 @@ def compute_inverse_boltzmann_helper(statistical_potential, inverse_boltzmann_va
         result.append(result_i)
 
     return result
+
+def compute_inverse_botzmann(statistical_potentials, pdbs):
+    """Computes inverse Boltzmann of several StatisticalPotentials
+    for each PDB structure with a unified cache for faster computation.
+    """
+    h_list = list()
+    results = list()
+
+    for sp in statistical_potentials:
+        for idx, h in enumerate(sp._heuristics):
+            if h in h_list:
+                sp._heuristics[idx] = h_list[h_list.index(h)]
+            else:
+                h_list.append(h)
+
+    for sp in statistical_potentials:
+        sp._approximate_sp = w_heuristics(sp._heuristics)
+
+    for sp in statistical_potentials:
+        results.append(sp.compute_inverse_boltzmann(pdbs))
+
+    return results

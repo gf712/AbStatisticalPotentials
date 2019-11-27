@@ -7,10 +7,8 @@ In the backend the library uses MDTraj, but an option for ProStruct will be adde
 two StatisticalPotential objects using DSSPHeuristic for the same position and PDB dataset.
 
 ## TODO:
-	- Add support for sparse data correction
 	- Add support for calculating various statistical potential values using the job_submitter.py
 	- Add parallel processing option
-	- Add optimisation where a user can manually share StatisticalPotential heuristics for efficient caching 
 
 ## Usage:
 
